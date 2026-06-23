@@ -1,0 +1,2 @@
+Build requested: 2026-06-23
+Target: ZIP Image to PDF 2.0, Windows x64, single-file EXE

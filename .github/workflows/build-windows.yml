@@ -26,16 +26,22 @@ jobs:
           python-version: "3.12"
           architecture: "x64"
           cache: "pip"
-          cache-dependency-path: build_payload.b64
+          cache-dependency-path: payload/part-00
 
       - name: Decode source package
         shell: pwsh
         run: |
-          $encoded = (Get-Content -Raw -Path "build_payload.b64").Trim()
+          $parts = Get-ChildItem -Path "payload\part-*" | Sort-Object Name
+          if ($parts.Count -ne 9) { throw "Expected 9 source payload parts, found $($parts.Count)." }
+          $encoded = ($parts | ForEach-Object { (Get-Content -Raw -Path $_.FullName).Trim() }) -join ""
           [System.IO.File]::WriteAllBytes(
             (Join-Path $PWD "source.zip"),
             [System.Convert]::FromBase64String($encoded)
           )
+          $payloadHash = (Get-FileHash "source.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($payloadHash -ne "8f437e06304eff3a408eec3f528a12baea280c83aadd384992c3f962493f7fcf") {
+            throw "Decoded source package hash mismatch: $payloadHash"
+          }
           Expand-Archive -Path "source.zip" -DestinationPath "src" -Force
           if (-not (Test-Path "src\main.py")) { throw "Decoded source package is invalid." }
 

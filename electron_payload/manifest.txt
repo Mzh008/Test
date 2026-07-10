@@ -1,0 +1,6 @@
+parts=3
+source_zip_bytes=33242
+source_zip_sha256=ec6e83b27fe5ad0e732dc1ac08f524d2276e19d05e5d42d6553378ef774f82c4
+application=ZIP Image to PDF 3.0
+platform=Windows x64
+ui=Electron embedded Chromium

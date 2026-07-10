@@ -1,0 +1,121 @@
+name: Build ZIP Image to PDF Chromium v3
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "electron_payload/**"
+      - ".github/workflows/build-windows-electron.yml"
+      - "BUILD_CHROMIUM_V3.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-portable-exe:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decode source package
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem -Path "electron_payload\part-*" | Sort-Object Name
+          if ($parts.Count -ne 3) { throw "Expected 3 payload parts, found $($parts.Count)." }
+          $encoded = ($parts | ForEach-Object { (Get-Content -Raw -Path $_.FullName).Trim() }) -join ""
+          [System.IO.File]::WriteAllBytes((Join-Path $PWD "source.zip"), [System.Convert]::FromBase64String($encoded))
+          $hash = (Get-FileHash "source.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne "ec6e83b27fe5ad0e732dc1ac08f524d2276e19d05e5d42d6553378ef774f82c4") { throw "Payload hash mismatch: $hash" }
+          Expand-Archive -Path "source.zip" -DestinationPath $PWD -Force
+          if (-not (Test-Path "windows_chromium_v3\src\main.cjs")) { throw "Decoded source package is invalid." }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        working-directory: windows_chromium_v3
+        run: |
+          npm install --no-audit --no-fund
+          python -m pip install --disable-pip-version-check pillow
+          python tools/create_icon.py
+
+      - name: Unit tests
+        working-directory: windows_chromium_v3
+        run: npm test
+
+      - name: 1,000 WebP stress test
+        working-directory: windows_chromium_v3
+        run: npm run stress -- --count 1000 --width 96 --height 128
+
+      - name: Build Windows portable EXE
+        working-directory: windows_chromium_v3
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run build:win
+
+      - name: Locate EXE
+        id: exe
+        shell: pwsh
+        working-directory: windows_chromium_v3
+        run: |
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) { throw "Windows EXE was not generated." }
+          "path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Packaged EXE self-test
+        shell: pwsh
+        working-directory: windows_chromium_v3
+        run: |
+          $testDir = Join-Path $PWD "exe-self-test"
+          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+          $process = Start-Process -FilePath "${{ steps.exe.outputs.path }}" -ArgumentList @("--self-test", $testDir) -PassThru -Wait
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path "$testDir\SELF_TEST_FAILED.txt") { Get-Content "$testDir\SELF_TEST_FAILED.txt" }
+            throw "Packaged EXE self-test failed with exit code $($process.ExitCode)."
+          }
+          if (-not (Test-Path "$testDir\SELF_TEST_OK.txt")) { throw "Self-test success marker is missing." }
+
+      - name: Assemble release
+        shell: pwsh
+        working-directory: windows_chromium_v3
+        run: |
+          New-Item -ItemType Directory -Force -Path "release" | Out-Null
+          Copy-Item "${{ steps.exe.outputs.path }}" "release\ZIP图片转PDF.exe"
+          Copy-Item "Windows使用说明.txt" "release\使用说明.txt"
+          Copy-Item "exe-self-test\SELF_TEST_OK.txt" "release\EXE自检结果.txt"
+          $hash = (Get-FileHash "release\ZIP图片转PDF.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ZIP图片转PDF.exe" | Out-File -Encoding ascii "release\ZIP图片转PDF.exe.sha256"
+          $size = (Get-Item "release\ZIP图片转PDF.exe").Length
+          $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          @"
+          ZIP 图片转 PDF 3.0 Windows 构建验证
+          构建时间：$builtAt
+          平台：Windows x64
+          界面：内置 Chromium
+          EXE 字节数：$size
+          SHA-256：$hash
+          单元测试：通过
+          1000 张 WebP 压力测试：通过
+          打包后 EXE 自检：通过
+          "@ | Out-File -Encoding utf8 "release\Windows构建验证.txt"
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZipImageToPDF-Windows-x64-v3.0
+          path: windows_chromium_v3/release/*
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 7

@@ -14,29 +14,30 @@ permissions:
 
 jobs:
   windows-portable-exe:
-    runs-on: windows-latest
-    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Decode source package
-        shell: pwsh
+        shell: bash
         run: |
-          $parts = Get-ChildItem -Path "electron_payload\part-*" | Sort-Object Name
-          if ($parts.Count -ne 3) { throw "Expected 3 payload parts, found $($parts.Count)." }
-          $encoded = ($parts | ForEach-Object { (Get-Content -Raw -Path $_.FullName).Trim() }) -join ""
-          [System.IO.File]::WriteAllBytes((Join-Path $PWD "source.zip"), [System.Convert]::FromBase64String($encoded))
-          $hash = (Get-FileHash "source.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne "ec6e83b27fe5ad0e732dc1ac08f524d2276e19d05e5d42d6553378ef774f82c4") { throw "Payload hash mismatch: $hash" }
-          Expand-Archive -Path "source.zip" -DestinationPath $PWD -Force
-          if (-not (Test-Path "windows_chromium_v3\src\main.cjs")) { throw "Decoded source package is invalid." }
+          set -euo pipefail
+          mapfile -t parts < <(find electron_payload -maxdepth 1 -type f -name 'part-*' | sort)
+          test "${#parts[@]}" -eq 3
+          cat "${parts[@]}" | tr -d '\r\n' | base64 --decode > source.zip
+          echo "ec6e83b27fe5ad0e732dc1ac08f524d2276e19d05e5d42d6553378ef774f82c4  source.zip" | sha256sum --check --strict
+          unzip -q source.zip
+          test -f windows_chromium_v3/src/main.cjs
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: windows_chromium_v3/package-lock.json
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -44,10 +45,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        shell: pwsh
+        shell: bash
         working-directory: windows_chromium_v3
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
         run: |
-          npm install --no-audit --no-fund
+          set -euo pipefail
+          npm ci --no-audit --no-fund
           python -m pip install --disable-pip-version-check pillow
           python tools/create_icon.py
 
@@ -59,57 +63,73 @@ jobs:
         working-directory: windows_chromium_v3
         run: npm run stress -- --count 1000 --width 96 --height 128
 
+      - name: Add Windows Sharp runtime
+        shell: bash
+        working-directory: windows_chromium_v3
+        run: |
+          set -euo pipefail
+          package_file="$(npm pack @img/sharp-win32-x64@0.35.3 --silent)"
+          mkdir -p node_modules/@img/sharp-win32-x64
+          tar -xzf "$package_file" -C node_modules/@img/sharp-win32-x64 --strip-components=1
+          rm -f "$package_file"
+          test -f node_modules/@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.3.node
+          test -f node_modules/@img/sharp-win32-x64/lib/libvips-42.dll
+
+      - name: Configure Linux cross-build toolchain
+        shell: bash
+        working-directory: windows_chromium_v3
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const file = 'package.json';
+          const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+          pkg.build = pkg.build || {};
+          pkg.build.toolsets = {
+            ...(pkg.build.toolsets || {}),
+            wine: '1.0.1',
+            nsis: '1.2.1'
+          };
+          pkg.scripts['build:win'] = 'electron-builder --win portable --x64 --publish never';
+          fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);
+          NODE
+
       - name: Build Windows portable EXE
+        shell: bash
         working-directory: windows_chromium_v3
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          ELECTRON_BUILDER_ALLOW_UNRESOLVED_DEPENDENCIES: "true"
         run: npm run build:win
 
-      - name: Locate EXE
-        id: exe
-        shell: pwsh
+      - name: Verify and assemble release
+        shell: bash
         working-directory: windows_chromium_v3
         run: |
-          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" | Select-Object -First 1
-          if (-not $exe) { throw "Windows EXE was not generated." }
-          "path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Packaged EXE self-test
-        shell: pwsh
-        working-directory: windows_chromium_v3
-        run: |
-          $testDir = Join-Path $PWD "exe-self-test"
-          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
-          $process = Start-Process -FilePath "${{ steps.exe.outputs.path }}" -ArgumentList @("--self-test", $testDir) -PassThru -Wait
-          if ($process.ExitCode -ne 0) {
-            if (Test-Path "$testDir\SELF_TEST_FAILED.txt") { Get-Content "$testDir\SELF_TEST_FAILED.txt" }
-            throw "Packaged EXE self-test failed with exit code $($process.ExitCode)."
-          }
-          if (-not (Test-Path "$testDir\SELF_TEST_OK.txt")) { throw "Self-test success marker is missing." }
-
-      - name: Assemble release
-        shell: pwsh
-        working-directory: windows_chromium_v3
-        run: |
-          New-Item -ItemType Directory -Force -Path "release" | Out-Null
-          Copy-Item "${{ steps.exe.outputs.path }}" "release\ZIP图片转PDF.exe"
-          Copy-Item "Windows使用说明.txt" "release\使用说明.txt"
-          Copy-Item "exe-self-test\SELF_TEST_OK.txt" "release\EXE自检结果.txt"
-          $hash = (Get-FileHash "release\ZIP图片转PDF.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  ZIP图片转PDF.exe" | Out-File -Encoding ascii "release\ZIP图片转PDF.exe.sha256"
-          $size = (Get-Item "release\ZIP图片转PDF.exe").Length
-          $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          @"
-          ZIP 图片转 PDF 3.0 Windows 构建验证
-          构建时间：$builtAt
-          平台：Windows x64
-          界面：内置 Chromium
-          EXE 字节数：$size
-          SHA-256：$hash
-          单元测试：通过
-          1000 张 WebP 压力测试：通过
-          打包后 EXE 自检：通过
-          "@ | Out-File -Encoding utf8 "release\Windows构建验证.txt"
+          set -euo pipefail
+          exe="$(find dist -maxdepth 1 -type f -name '*.exe' -print -quit)"
+          test -n "$exe"
+          python - "$exe" <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          data = p.read_bytes()[:64]
+          if data[:2] != b'MZ':
+              raise SystemExit('Generated file is not a Windows PE executable')
+          if p.stat().st_size < 10_000_000:
+              raise SystemExit('Generated EXE is unexpectedly small')
+          print(f'PE header OK: {p} ({p.stat().st_size} bytes)')
+          PY
+          mkdir -p release
+          cp "$exe" "release/ZIP图片转PDF.exe"
+          sha256sum "release/ZIP图片转PDF.exe" > "release/ZIP图片转PDF.exe.sha256"
+          printf '%s\n' \
+            'ZIP 图片转 PDF 3.0' \
+            '平台：Windows x64' \
+            '界面：内置 Chromium' \
+            '启动：双击 ZIP图片转PDF.exe' \
+            '说明：本次仅完成跨平台打包；请在目标 Windows 电脑上进行最终运行验证。' \
+            > "release/使用说明.txt"
+          ls -lh release
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v4

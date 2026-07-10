@@ -2,3 +2,5 @@ Build requested: 2026-07-10
 Application: ZIP Image to PDF 3.0
 Target: Windows x64 portable single-file EXE
 UI runtime: embedded Chromium
+Builder: Ubuntu cross-build with portable Wine toolset
+Attempt: 2026-07-10-cross-build-1
